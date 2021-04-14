@@ -4,6 +4,11 @@
   "description": "Code formatter using prettier",
   "version": "6.3.2",
   "publisher": "esbenp",
+  "enableProposedApi": true,
+  "workspaceTrust": {
+    "request": "onDemand",
+    "description": "because we like security"
+  },
   "author": "Prettier <@prettiercode>",
   "galleryBanner": {
     "color": "#ffe04b",
@@ -72,7 +77,7 @@
     "watch": "tsc --watch -p ./",
     "webpack-dev": "webpack --mode development --watch",
     "webpack": "webpack --mode development",
-    "postinstall": "husky install"
+    "postinstall": "husky install && pushd src && vscode-dts dev && popd"
   },
   "lint-staged": {
     "**/*.{ts,json,md,yml,js}": [
@@ -91,7 +96,7 @@
     "@types/resolve": "^1.17.0",
     "@types/semver": "^7.3.1",
     "@types/sinon": "^9.0.11",
-    "@types/vscode": "1.53.0",
+    "@types/vscode": "1.55.0",
     "@typescript-eslint/eslint-plugin": "^4.17.0",
     "@typescript-eslint/parser": "^4.3.0",
     "eslint": "^7.10.0",
@@ -107,7 +112,8 @@
     "vscode-nls-dev": "^3.3.2",
     "vscode-test": "^1.4.0",
     "webpack": "^5.24.4",
-    "webpack-cli": "^4.2.0"
+    "webpack-cli": "^4.2.0",
+    "vscode-dts": "^0.3.1"
   },
   "dependencies": {
     "find-up": "^5.0.0",

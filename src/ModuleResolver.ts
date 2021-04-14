@@ -5,14 +5,7 @@ import * as path from "path";
 import * as prettier from "prettier";
 import * as resolve from "resolve";
 import * as semver from "semver";
-import {
-  commands,
-  Disposable,
-  MessageItem,
-  Uri,
-  window,
-  workspace,
-} from "vscode";
+import { commands, Disposable, MessageItem, Uri, workspace } from "vscode";
 import { resolveGlobalNodePath, resolveGlobalYarnPath } from "./Files";
 import { LoggingService } from "./LoggingService";
 import {
@@ -22,7 +15,6 @@ import {
   USING_BUNDLED_PRETTIER,
 } from "./message";
 import {
-  getFromGlobalState,
   getFromWorkspaceState,
   updateGlobalState,
   updateWorkspaceState,
@@ -45,10 +37,6 @@ export enum ConfirmationSelection {
 
 export interface ConfirmMessageItem extends MessageItem {
   value: ConfirmationSelection;
-}
-
-interface PrettierExecutionState {
-  libs: { [key: string]: boolean };
 }
 
 const globalPaths: {
@@ -86,46 +74,45 @@ function globalPathGet(packageManager: PackageManagers): string | undefined {
   return undefined;
 }
 
-async function askForModuleApproval(
-  modulePath: string,
-  isGlobal: boolean
-): Promise<ConfirmationSelection> {
-  const libraryUri = Uri.file(modulePath);
-  const folder = workspace.getWorkspaceFolder(libraryUri);
-  let message: string;
-  if (folder !== undefined) {
-    const relativePath = workspace.asRelativePath(libraryUri);
-    message = `The Prettier extension will use '${relativePath}' for validation, which is installed locally in folder '${folder.name}'. Do you allow the execution of this Prettier version including all plugins and configuration files it will load on your behalf?\n\nPress 'Allow Everywhere' to remember the choice for all workspaces.`;
-  } else {
-    message = isGlobal
-      ? `The Prettier extension will use a globally installed Prettier library for validation. Do you allow the execution of this Prettier version including all plugins and configuration files it will load on your behalf?\n\nPress 'Always Allow' to remember the choice for all workspaces.`
-      : `The Prettier extension will use a locally installed Prettier library for validation. Do you allow the execution of this Prettier version including all plugins and configuration files it will load on your behalf?\n\nPress 'Always Allow' to remember the choice for all workspaces.`;
-  }
-
-  const messageItems: ConfirmMessageItem[] = [
-    { title: "Allow Everywhere", value: ConfirmationSelection.alwaysAllow },
-    { title: "Allow", value: ConfirmationSelection.allow },
-    { title: "Deny", value: ConfirmationSelection.deny },
-  ];
-  const item = await window.showInformationMessage<ConfirmMessageItem>(
-    message,
-    { modal: true },
-    ...messageItems
-  );
-
-  // Dialog got canceled.
-  if (item === undefined) {
-    return ConfirmationSelection.deny;
-  } else {
-    return item.value;
-  }
-}
-
 export class ModuleResolver implements Disposable {
   private path2Module = new Map<string, PrettierModule>();
   private deniedModules = new Set<string>();
 
   constructor(private loggingService: LoggingService) {}
+
+  /**
+   * Returns an Interator that will return all possible instances of the prettier module.
+   * @param fileName The path of the file to use as the starting point. If none provided, the bundled prettier will be used.
+   */
+  public async *enumeratePrettierInstances(
+    fileName?: string
+  ): AsyncIterableIterator<PrettierModule> {
+    if (!fileName) {
+      return yield prettier;
+    }
+
+    const { prettierPath, resolveGlobalModules } = getConfig(
+      Uri.file(fileName)
+    );
+
+    const workspaceModule = this.resolveWorkspacePrettierModule(
+      fileName,
+      prettierPath
+    );
+    if (workspaceModule) {
+      yield workspaceModule;
+    }
+
+    // If global modules allowed, look for global module
+    if (resolveGlobalModules) {
+      const globalModule = await this.resolveGlobalPrettierModule();
+      if (globalModule) {
+        yield globalModule;
+      }
+    }
+
+    yield prettier;
+  }
 
   /**
    * Returns an instance of the prettier module.
@@ -134,131 +121,14 @@ export class ModuleResolver implements Disposable {
   public async getPrettierInstance(
     fileName?: string
   ): Promise<PrettierModule | undefined> {
-    if (!fileName) {
-      return prettier;
-    }
-
-    const { prettierPath, resolveGlobalModules } = getConfig(
-      Uri.file(fileName)
-    );
-
-    // Look for local module
-    let modulePath: string | undefined = undefined;
-    let isGlobalModule = false;
-
-    try {
-      modulePath = prettierPath
-        ? getWorkspaceRelativePath(fileName, prettierPath)
-        : this.findPkg(fileName, "prettier");
-    } catch (error) {
-      let moduleDirectory = "";
-      if (!modulePath) {
-        // If findPkg threw an error from `resolve.sync`, attempt to parse the
-        // directory it failed on to provide a better error message
-        const resolveSyncPathRegex = /Cannot find module '.*' from '(.*)'/;
-        const resolveErrorMatches = resolveSyncPathRegex.exec(error.message);
-        if (resolveErrorMatches && resolveErrorMatches[1]) {
-          moduleDirectory = resolveErrorMatches[1];
-        }
+    for await (const moduleInstance of this.enumeratePrettierInstances(
+      fileName
+    )) {
+      if (moduleInstance === prettier) {
+        this.loggingService.logInfo(USING_BUNDLED_PRETTIER);
       }
-
-      this.loggingService.logInfo(
-        `Attempted to load Prettier module from ${
-          modulePath || moduleDirectory || "package.json"
-        }`
-      );
-      this.loggingService.logError(FAILED_TO_LOAD_MODULE_MESSAGE, error);
-
-      // Return here because there is a local module, but we can't resolve it.
-      // Must do NPM install for prettier to work.
-      return undefined;
+      return moduleInstance;
     }
-
-    // If global modules allowed, look for global module
-    if (resolveGlobalModules && !modulePath) {
-      const packageManager = (await commands.executeCommand<
-        "npm" | "pnpm" | "yarn"
-      >("npm.packageManager"))!;
-      const resolvedGlobalPackageManagerPath = globalPathGet(packageManager);
-      if (resolvedGlobalPackageManagerPath) {
-        const globalModulePath = path.join(
-          resolvedGlobalPackageManagerPath,
-          "prettier"
-        );
-        if (fs.existsSync(globalModulePath)) {
-          modulePath = globalModulePath;
-          isGlobalModule = true;
-        }
-      }
-    }
-
-    let moduleInstance: PrettierModule | undefined = undefined;
-    if (modulePath !== undefined) {
-      // First check module cache
-      moduleInstance = this.path2Module.get(modulePath);
-      if (moduleInstance) {
-        return moduleInstance;
-      } else {
-        try {
-          const isAllowed = await this.isTrustedModule(
-            modulePath,
-            isGlobalModule
-          );
-          if (isAllowed) {
-            moduleInstance = this.loadNodeModule<PrettierModule>(modulePath);
-            if (moduleInstance) {
-              this.path2Module.set(modulePath, moduleInstance);
-            }
-          } else {
-            // Module is not allowed
-            return undefined;
-          }
-        } catch (error) {
-          this.loggingService.logInfo(
-            `Attempted to load Prettier module from ${
-              modulePath || "package.json"
-            }`
-          );
-          this.loggingService.logError(FAILED_TO_LOAD_MODULE_MESSAGE, error);
-
-          // Returning here because module didn't load.
-          return undefined;
-        }
-      }
-    }
-
-    if (!moduleInstance) {
-      this.loggingService.logDebug(USING_BUNDLED_PRETTIER);
-    }
-
-    if (moduleInstance) {
-      // If the instance is missing `format`, it's probably
-      // not an instance of Prettier
-      const isPrettierInstance = !!moduleInstance.format;
-      const isValidVersion =
-        moduleInstance.version &&
-        !!moduleInstance.getSupportInfo &&
-        !!moduleInstance.getFileInfo &&
-        !!moduleInstance.resolveConfig &&
-        semver.gte(moduleInstance.version, minPrettierVersion);
-
-      if (!isPrettierInstance && prettierPath) {
-        this.loggingService.logError(INVALID_PRETTIER_PATH_MESSAGE);
-        return undefined;
-      }
-
-      if (!isValidVersion) {
-        this.loggingService.logInfo(
-          `Attempted to load Prettier module from ${modulePath}`
-        );
-        this.loggingService.logError(OUTDATED_PRETTIER_VERSION_MESSAGE);
-        return undefined;
-      }
-    }
-
-    // If we made it this far, either a valid module was loaded or
-    // no modules where found anywhere so we fall back to bundled instance
-    return moduleInstance || prettier;
   }
 
   /**
@@ -288,42 +158,141 @@ export class ModuleResolver implements Disposable {
     this.path2Module.clear();
   }
 
-  private async isTrustedModule(modulePath: string, isGlobal: boolean) {
-    if (getFromGlobalState(alwaysAllowedExecutionStateKey, false)) {
-      return true;
-    }
+  private isValidPrettierModule(
+    moduleInstance: typeof prettier,
+    prettierPath: string | undefined,
+    modulePath: string
+  ): boolean {
+    // If the instance is missing `format`, it's probably
+    // not an instance of Prettier
+    const isPrettierInstance = !!moduleInstance.format;
+    const isValidVersion =
+      moduleInstance.version &&
+      !!moduleInstance.getSupportInfo &&
+      !!moduleInstance.getFileInfo &&
+      !!moduleInstance.resolveConfig &&
+      semver.gte(moduleInstance.version, minPrettierVersion);
 
-    const moduleState = getFromGlobalState(moduleExecutionStateKey, {
-      libs: {},
-    }) as PrettierExecutionState;
-
-    if (this.deniedModules.has(modulePath)) {
+    if (!isPrettierInstance && prettierPath) {
+      this.loggingService.logError(INVALID_PRETTIER_PATH_MESSAGE);
       return false;
     }
 
-    let isTrustedModule = moduleState.libs[modulePath];
-    if (!isTrustedModule) {
-      const approvalResult = await askForModuleApproval(modulePath, isGlobal);
+    if (!isValidVersion) {
+      this.loggingService.logInfo(
+        `Attempted to load Prettier module from ${modulePath}`
+      );
+      this.loggingService.logError(OUTDATED_PRETTIER_VERSION_MESSAGE);
+      return false;
+    }
 
-      if (approvalResult === ConfirmationSelection.alwaysAllow) {
-        isTrustedModule = true;
-        updateGlobalState(alwaysAllowedExecutionStateKey, isTrustedModule);
-      } else {
-        isTrustedModule = approvalResult === ConfirmationSelection.allow;
+    return true;
+  }
 
-        if (isTrustedModule) {
-          moduleState.libs[modulePath] = isTrustedModule;
-          updateGlobalState(moduleExecutionStateKey, moduleState);
-        } else {
-          this.loggingService.logWarning(
-            `Module is not allowed to loaded from '${modulePath}'`
+  private resolveWorkspacePrettierModule(
+    fileName: string,
+    prettierPath: string | undefined
+  ): typeof prettier | undefined {
+    // Look for local module
+    let localModulePath: string | undefined = undefined;
+
+    try {
+      localModulePath = prettierPath
+        ? getWorkspaceRelativePath(fileName, prettierPath)
+        : this.findPkg(fileName, "prettier");
+    } catch (error) {
+      let moduleDirectory = "";
+      if (!localModulePath) {
+        // If findPkg threw an error from `resolve.sync`, attempt to parse the
+        // directory it failed on to provide a better error message
+        const resolveSyncPathRegex = /Cannot find module '.*' from '(.*)'/;
+        const resolveErrorMatches = resolveSyncPathRegex.exec(error.message);
+        if (resolveErrorMatches && resolveErrorMatches[1]) {
+          moduleDirectory = resolveErrorMatches[1];
+        }
+      }
+
+      this.loggingService.logInfo(
+        `Attempted to load Prettier module from ${
+          localModulePath || moduleDirectory || "package.json"
+        }`
+      );
+      this.loggingService.logError(FAILED_TO_LOAD_MODULE_MESSAGE, error);
+    }
+
+    if (localModulePath !== undefined) {
+      if (workspace.isTrusted) {
+        const moduleInstance = this.resolvePrettierModule(
+          localModulePath,
+          prettierPath
+        );
+        if (moduleInstance) {
+          this.loggingService.logInfo(
+            `Using Prettier module at: ${localModulePath}`
           );
-          this.deniedModules.add(modulePath);
+          return moduleInstance;
+        }
+      } else {
+        workspace.requestWorkspaceTrust({ modal: false });
+        this.loggingService.logInfo(
+          `Attempted to load Prettier module from ${localModulePath} but workspace is not trusted.`
+        );
+      }
+    }
+  }
+
+  private async resolveGlobalPrettierModule(): Promise<
+    typeof prettier | undefined
+  > {
+    const packageManager = (await commands.executeCommand<
+      "npm" | "pnpm" | "yarn"
+    >("npm.packageManager"))!;
+    const resolvedGlobalPackageManagerPath = globalPathGet(packageManager);
+    if (resolvedGlobalPackageManagerPath) {
+      const globalModulePath = path.join(
+        resolvedGlobalPackageManagerPath,
+        "prettier"
+      );
+      if (fs.existsSync(globalModulePath)) {
+        const moduleInstance = this.resolvePrettierModule(
+          globalModulePath,
+          undefined
+        );
+        if (moduleInstance) {
+          this.loggingService.logInfo(
+            `Using Prettier module at: ${globalModulePath}`
+          );
+          return moduleInstance;
         }
       }
     }
+  }
 
-    return isTrustedModule;
+  private resolvePrettierModule(
+    modulePath: string,
+    prettierPath: string | undefined
+  ): typeof prettier | undefined {
+    // First check module cache
+    let moduleInstance = this.path2Module.get(modulePath);
+    if (moduleInstance) {
+      return moduleInstance;
+    } else {
+      try {
+        moduleInstance = this.loadNodeModule<PrettierModule>(modulePath);
+        if (
+          moduleInstance &&
+          this.isValidPrettierModule(moduleInstance, prettierPath, modulePath)
+        ) {
+          this.path2Module.set(modulePath, moduleInstance);
+          return moduleInstance;
+        }
+      } catch (error) {
+        this.loggingService.logInfo(
+          `Attempted to load Prettier module from ${modulePath}`
+        );
+        this.loggingService.logError(FAILED_TO_LOAD_MODULE_MESSAGE, error);
+      }
+    }
   }
 
   // Source: https://github.com/microsoft/vscode-eslint/blob/master/server/src/eslintServer.ts
