@@ -22,7 +22,11 @@ import {
   PrettierModule,
   RangeFormattingOptions,
 } from "./types";
-import { getConfig, getWorkspaceRelativePath } from "./util";
+import {
+  getConfig,
+  getWorkspaceRelativePath,
+  isWorkspaceRelativePath,
+} from "./util";
 
 interface ISelectors {
   rangeLanguageSelector: ReadonlyArray<DocumentFilter>;
@@ -353,7 +357,7 @@ export default class PrettierEditService implements Disposable {
 
     const vscodeConfig = getConfig(uri);
 
-    let configPath: string | undefined;
+    let configPath: string | undefined = undefined;
     try {
       if (!isUntitled) {
         configPath = (await prettier.resolveConfigFile(fileName)) ?? undefined;
@@ -367,20 +371,31 @@ export default class PrettierEditService implements Disposable {
       return;
     }
 
+    if (vscodeConfig.configPath) {
+      configPath = getWorkspaceRelativePath(fileName, vscodeConfig.configPath);
+    }
+
+    if (!workspace.isTrusted && isWorkspaceRelativePath(fileName, configPath)) {
+      this.loggingService.logInfo(
+        "Ignoring config path because workspace is not trusted."
+      );
+      workspace.requestWorkspaceTrust({ modal: false });
+      configPath = undefined;
+    }
+
     const resolveConfigOptions: prettier.ResolveConfigOptions = {
-      config: isUntitled
-        ? undefined
-        : vscodeConfig.configPath
-        ? getWorkspaceRelativePath(fileName, vscodeConfig.configPath)
-        : configPath,
+      config: configPath,
       editorconfig: isUntitled ? undefined : vscodeConfig.useEditorConfig,
     };
 
     let resolvedConfig: prettier.Options | null;
     try {
-      resolvedConfig = isUntitled
-        ? null
-        : await prettier.resolveConfig(fileName, resolveConfigOptions);
+      // If the workspace isn't trusted and we didn't find a config file
+      // then don't try to resolve a config to play it safe.
+      resolvedConfig =
+        isUntitled || (!workspace.isTrusted && !configPath)
+          ? null
+          : await prettier.resolveConfig(fileName, resolveConfigOptions);
     } catch (error) {
       this.loggingService.logError(
         "Invalid prettier configuration file detected.",

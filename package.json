@@ -7,7 +7,11 @@
   "enableProposedApi": true,
   "workspaceTrust": {
     "request": "onDemand",
-    "description": "because we like security"
+    "description": "because we like security",
+    "requiredForConfigurations": [
+      "prettier.prettierPath",
+      "prettier.configPath"
+    ]
   },
   "author": "Prettier <@prettiercode>",
   "galleryBanner": {
